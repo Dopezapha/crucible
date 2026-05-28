@@ -395,6 +395,7 @@ The backend runs several background workers for system health and data consisten
 | Module | Description |
 |---|---|
 | `sys_metrics` | Build system metrics exporter with PostgreSQL persistence and Redis caching (compilation times, dependency counts, cache hit rates) |
+| `cache_metrics` | Cache operation analytics with PostgreSQL event storage and Redis-cached summaries |
 | `error_recovery` | Tracks retry state for failing tasks with configurable max retries |
 | `log_aggregator` | Async MPSC-based log pipeline; persists entries via a background worker |
 | `log_alerts` | Threshold-based alerting over the log pipeline with sliding-window evaluation |
@@ -865,6 +866,15 @@ println!("Success rate: {}%", summary.success_rate);
 - `get_project_summary(project_name)` - Get aggregated statistics
 - `get_recent_metrics(limit)` - Get recent builds across all projects
 - `delete_project_metrics(project_name)` - Delete all metrics for a project
+
+## Cache Metrics and Analytics
+
+The `cache_metrics` module records cache operations as durable PostgreSQL events and caches aggregate summaries in Redis with a short TTL.
+
+- `CacheMetricsService::record(input)` - Persist a cache operation and invalidate affected summaries
+- `CacheMetricsService::recent(query)` - Read bounded recent cache events
+- `CacheMetricsService::summary(query)` - Return hit/miss counts, hit rate, latency, payload totals, and operation breakdowns
+- `CacheMetricsService::ensure_schema()` - Create the table and indexes for tests or embedded deployments
 
 ## Backup Service Configuration
 
