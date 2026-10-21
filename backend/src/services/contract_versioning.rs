@@ -76,6 +76,32 @@ pub struct ContractVersion {
     pub created_at: DateTime<Utc>,
 }
 
+impl ContractVersion {
+    pub fn precedence_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (
+            parse_version_ignoring_build(&self.version),
+            parse_version_ignoring_build(&other.version),
+        ) {
+            (Ok(v1), Ok(v2)) => v1.cmp(&v2),
+            _ => self.version.cmp(&other.version),
+        }
+    }
+}
+
+impl PartialOrd for ContractVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContractVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.precedence_cmp(other)
+            .then_with(|| self.created_at.cmp(&other.created_at))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionDiffRequest {
@@ -544,6 +570,25 @@ Build failed in deterministic container.
             decompiled_preview,
         }
     }
+
+    /// Compare semantic version precedence of two version strings, ignoring build metadata according to SemVer 2.0.0.
+    pub fn compare_version_precedence(&self, v1: &str, v2: &str) -> Result<std::cmp::Ordering, AppError> {
+        compare_version_precedence(v1, v2)
+    }
+}
+
+pub fn parse_version_ignoring_build(version_str: &str) -> Result<semver::Version, AppError> {
+    let mut ver = semver::Version::parse(version_str.trim()).map_err(|e| {
+        AppError::ValidationError(format!("Invalid semantic version '{}': {}", version_str, e))
+    })?;
+    ver.build = semver::BuildMetadata::EMPTY;
+    Ok(ver)
+}
+
+pub fn compare_version_precedence(v1: &str, v2: &str) -> Result<std::cmp::Ordering, AppError> {
+    let parsed1 = parse_version_ignoring_build(v1)?;
+    let parsed2 = parse_version_ignoring_build(v2)?;
+    Ok(parsed1.cmp(&parsed2))
 }
 
 fn compute_deterministic_wasm_bytes(source_code: &str) -> Vec<u8> {
@@ -577,15 +622,14 @@ fn validate_version_request(request: &CreateContractVersionRequest) -> Result<()
 }
 
 fn is_semver(version: &str) -> bool {
-    let parts: Vec<_> = version.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    semver::Version::parse(version.trim()).is_ok()
 }
 
 fn major_version(version: &str) -> Option<u64> {
-    version.split('.').next()?.parse().ok()
+    semver::Version::parse(version.trim())
+        .map(|v| v.major)
+        .ok()
+        .or_else(|| version.trim().split('.').next()?.parse().ok())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -774,5 +818,70 @@ mod tests {
         assert!(summary.exported_functions.contains(&"get_count".to_string()));
         assert!(summary.imported_functions.contains(&"env.call".to_string()));
         assert!(summary.decompiled_preview.contains("pub struct Contract;"));
+    }
+
+    #[test]
+    fn test_semver_build_metadata_ignored_in_precedence() {
+        use std::cmp::Ordering;
+
+        let v1 = "1.0.0+build.1";
+        let v2 = "1.0.0+build.2";
+        let v3 = "1.0.0";
+        let v4 = "1.0.1+build.1";
+        let v_alpha = "1.0.0-alpha+build.99";
+        let v_beta = "1.0.0-beta+build.01";
+
+        assert_eq!(compare_version_precedence(v1, v2).unwrap(), Ordering::Equal);
+        assert_eq!(compare_version_precedence(v1, v3).unwrap(), Ordering::Equal);
+        assert_eq!(compare_version_precedence(v1, v4).unwrap(), Ordering::Less);
+        assert_eq!(compare_version_precedence(v4, v1).unwrap(), Ordering::Greater);
+        assert_eq!(compare_version_precedence(v_alpha, v_beta).unwrap(), Ordering::Less);
+    }
+
+    #[tokio::test]
+    async fn test_create_version_accepts_build_metadata() {
+        let service = ContractVersioningService::new(pool());
+        let version = service
+            .create_version(CreateContractVersionRequest {
+                contract_id: "contract-metadata".to_string(),
+                version: "2.4.1+stellar.release.2026".to_string(),
+                source_code: "pub fn test() {}".to_string(),
+                wasm_hash: None,
+                changelog: Some("Build metadata version test".to_string()),
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(version.version, "2.4.1+stellar.release.2026");
+    }
+
+    #[test]
+    fn test_contract_version_struct_ordering_ignores_build_metadata() {
+        use std::cmp::Ordering;
+
+        let now = Utc::now();
+        let cv1 = ContractVersion {
+            id: "ver-1".to_string(),
+            contract_id: "c1".to_string(),
+            version: "1.2.3+sha.abc".to_string(),
+            source_hash: "hash1".to_string(),
+            wasm_hash: None,
+            changelog: None,
+            created_by: None,
+            created_at: now,
+        };
+        let cv2 = ContractVersion {
+            id: "ver-2".to_string(),
+            contract_id: "c1".to_string(),
+            version: "1.2.3+sha.xyz".to_string(),
+            source_hash: "hash2".to_string(),
+            wasm_hash: None,
+            changelog: None,
+            created_by: None,
+            created_at: now,
+        };
+
+        assert_eq!(cv1.precedence_cmp(&cv2), Ordering::Equal);
     }
 }

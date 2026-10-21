@@ -99,22 +99,34 @@ impl WebhookDispatcherWorker {
         computed.as_bytes().ct_eq(expected_signature.as_bytes()).into()
     }
 
-    /// Calculate exponential retry backoff duration with full jitter for a given attempt.
+    /// Calculate exponential retry backoff duration with full jitter for a given attempt,
+    /// enforcing a minimum backoff floor (base_delay / 2) to prevent zero-millisecond delay.
     pub fn calculate_retry_delay(&self, attempt: u32) -> Duration {
+        if self.base_delay_secs == 0 {
+            return Duration::ZERO;
+        }
+
         let factor = 2u64.saturating_pow(attempt.saturating_sub(1));
         let max_delay_ms = self.base_delay_secs.saturating_mul(factor).saturating_mul(1000);
         if max_delay_ms == 0 {
             return Duration::ZERO;
         }
 
+        let min_delay_ms = self.base_delay_secs.saturating_mul(1000) / 2;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as u64;
         let mixed = nanos.wrapping_add((attempt as u64).wrapping_mul(6_364_136_223_846_793_005));
-        let jitter_ms = mixed % max_delay_ms;
 
-        Duration::from_millis(jitter_ms)
+        let jitter_range = max_delay_ms.saturating_sub(min_delay_ms);
+        let jitter_ms = if jitter_range > 0 {
+            mixed % jitter_range
+        } else {
+            0
+        };
+
+        Duration::from_millis(min_delay_ms.saturating_add(jitter_ms))
     }
 
     /// Dispatch a webhook event to an endpoint with HMAC signature.
@@ -145,17 +157,30 @@ impl WebhookDispatcherWorker {
             match tokio::time::timeout(WEBHOOK_TIMEOUT, async {
                 let url = validate_webhook_url(&endpoint.url)?;
                 let addresses = resolve_public_addresses(&url).await?;
+                let pinned_address = addresses
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("no resolved public address"))?;
+
                 let host = url
                     .host_str()
                     .ok_or_else(|| anyhow::anyhow!("webhook URL has no host"))?;
+
+                let mut dispatch_headers = headers.clone();
+                let host_header = match url.port() {
+                    Some(port) => format!("{}:{}", host, port),
+                    None => host.to_string(),
+                };
+                dispatch_headers.insert("Host".to_string(), host_header);
+
                 let client = reqwest::Client::builder()
                     .connect_timeout(WEBHOOK_TIMEOUT)
                     .timeout(WEBHOOK_TIMEOUT)
                     .redirect(reqwest::redirect::Policy::none())
-                    .resolve_to_addrs(host, &addresses)
+                    .resolve_to_addrs(host, &[pinned_address])
                     .build()?;
 
-                send_webhook_request(&client, &url, &headers, &serialized_body).await
+                send_webhook_request(&client, &url, &dispatch_headers, &serialized_body).await
             })
             .await
             {
@@ -334,10 +359,25 @@ mod tests {
     fn test_retry_backoff_calculation() {
         let worker = WebhookDispatcherWorker::new(5, 2);
 
-        assert!(worker.calculate_retry_delay(1) <= Duration::from_secs(2));
-        assert!(worker.calculate_retry_delay(2) <= Duration::from_secs(4));
-        assert!(worker.calculate_retry_delay(3) <= Duration::from_secs(8));
-        assert!(worker.calculate_retry_delay(4) <= Duration::from_secs(16));
+        // Verify non-zero minimum floor (base_delay / 2 = 1000ms)
+        let delay1 = worker.calculate_retry_delay(1);
+        assert!(delay1 >= Duration::from_millis(1000));
+        assert!(delay1 <= Duration::from_secs(2));
+
+        let delay2 = worker.calculate_retry_delay(2);
+        assert!(delay2 >= Duration::from_millis(1000));
+        assert!(delay2 <= Duration::from_secs(4));
+
+        let delay3 = worker.calculate_retry_delay(3);
+        assert!(delay3 >= Duration::from_millis(1000));
+        assert!(delay3 <= Duration::from_secs(8));
+
+        let delay4 = worker.calculate_retry_delay(4);
+        assert!(delay4 >= Duration::from_millis(1000));
+        assert!(delay4 <= Duration::from_secs(16));
+
+        let zero_worker = WebhookDispatcherWorker::new(5, 0);
+        assert_eq!(zero_worker.calculate_retry_delay(1), Duration::ZERO);
     }
 
     #[tokio::test]
@@ -449,5 +489,24 @@ mod tests {
         let log = worker.retry_webhook_delivery(&endpoint, &event).await;
         assert!(!log.success);
         assert_eq!(log.attempt, 1);
+    }
+
+    #[test]
+    fn test_host_header_formatting() {
+        let url1 = Url::parse("https://api.example.com/webhook").unwrap();
+        let host1 = url1.host_str().unwrap();
+        let header1 = match url1.port() {
+            Some(p) => format!("{}:{}", host1, p),
+            None => host1.to_string(),
+        };
+        assert_eq!(header1, "api.example.com");
+
+        let url2 = Url::parse("http://api.example.com:8443/webhook").unwrap();
+        let host2 = url2.host_str().unwrap();
+        let header2 = match url2.port() {
+            Some(p) => format!("{}:{}", host2, p),
+            None => host2.to_string(),
+        };
+        assert_eq!(header2, "api.example.com:8443");
     }
 }
