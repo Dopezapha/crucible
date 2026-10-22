@@ -180,7 +180,9 @@ impl WebhookDispatcherWorker {
                     .resolve_to_addrs(host, &[pinned_address])
                     .build()?;
 
-                send_webhook_request(&client, &url, &dispatch_headers, &serialized_body).await
+                send_webhook_request(&client, &url, &dispatch_headers, &serialized_body)
+                    .await
+                    .map_err(anyhow::Error::from)
             })
             .await
             {
